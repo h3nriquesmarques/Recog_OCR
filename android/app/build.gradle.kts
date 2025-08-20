@@ -50,6 +50,8 @@ dependencies {
 
     implementation("org.tensorflow:tensorflow-lite:$tfliteVersion")
     implementation("org.tensorflow:tensorflow-lite-select-tf-ops:$tfliteVersion")
+    implementation("com.google.android.gms:play-services-mlkit-text-recognition:19.0.1")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
 }
 
 // --- BLOCO DE RESOLUÇÃO DE DEPENDÊNCIAS (Para o erro de classes duplicadas) ---
