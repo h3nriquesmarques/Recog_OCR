@@ -1,35 +1,43 @@
 package com.example.ocr_recog
 
+// Import para Coroutines
+
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.ColorMatrix
+import android.graphics.ColorMatrixColorFilter
+import android.graphics.Paint
+import android.graphics.RectF
+import android.os.Environment
 import android.util.Log
 import androidx.annotation.NonNull
-import io.flutter.embedding.android.FlutterActivity
-import io.flutter.embedding.engine.FlutterEngine
-import io.flutter.plugin.common.MethodChannel
-import org.tensorflow.lite.Interpreter
-import org.tensorflow.lite.DataType
-import java.io.FileInputStream
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
-import java.nio.FloatBuffer
-import java.nio.channels.FileChannel
-import kotlin.collections.ArrayList
-import java.util.Arrays
-import android.graphics.RectF
+import com.google.android.gms.tasks.Tasks
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
-import com.google.android.gms.tasks.Tasks
-// Import para Coroutines
+import io.flutter.embedding.android.FlutterActivity
+import io.flutter.embedding.engine.FlutterEngine
+import io.flutter.plugin.common.MethodChannel
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.tensorflow.lite.DataType
+import org.tensorflow.lite.Interpreter
+import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.nio.FloatBuffer
+import java.nio.channels.FileChannel
+import java.text.SimpleDateFormat
+import java.util.Arrays
+import java.util.Date
+import java.util.Locale
 
-import android.graphics.ColorMatrix
-import android.graphics.ColorMatrixColorFilter
-import android.graphics.Paint
+import android.graphics.Matrix
+import androidx.exifinterface.media.ExifInterface
 
 
 data class Detection(
@@ -56,7 +64,7 @@ private var padY: Float = 0.0f
 class MainActivity: FlutterActivity() {
     private val CHANNEL = "com.example.ocr_recog/plate_recognition"
     private var tfliteInterpreter: Interpreter? = null
-    private val MODEL_PATH = "license-plate-finetune-v1s_int8.tflite"
+    private val MODEL_PATH = "best_float32.tflite"
 
     private val modelInputWidth: Int = 640
     private val modelInputHeight: Int = 640
@@ -72,6 +80,7 @@ class MainActivity: FlutterActivity() {
 
     private val modelOutputBufferLength: Int = outputBatchSize * outputNumFeaturesPerBox * outputNumBoxes * 4
 
+    private var lastFrameBitmap: Bitmap? = null
     override fun configureFlutterEngine(@NonNull flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL).setMethodCallHandler { call, result ->
@@ -94,7 +103,9 @@ class MainActivity: FlutterActivity() {
                                 return@launch
                             }
 
-                            val inputBuffer = preprocessBitmap(originalBitmap)
+                            val correctedBitmap = fixOrientation(originalBitmap, imagePath)
+
+                            val inputBuffer = preprocessBitmap(correctedBitmap)
                             val outputBuffer = ByteBuffer.allocateDirect(modelOutputBufferLength).order(ByteOrder.nativeOrder())
                             val outputMap = mutableMapOf<Int, Any>()
                             outputMap[0] = outputBuffer // 2. Passe o ByteBuffer para o mapa.
@@ -104,7 +115,7 @@ class MainActivity: FlutterActivity() {
                             outputBuffer.rewind()
                             val outputFloatBuffer = outputBuffer.asFloatBuffer()
 
-                            val plateText = postprocessOutput(outputFloatBuffer, originalBitmap)
+                            val plateText = postprocessOutput(outputFloatBuffer, correctedBitmap)
 
                             withContext(Dispatchers.Main) {
                                 result.success(plateText)
@@ -189,10 +200,42 @@ class MainActivity: FlutterActivity() {
         }
 
         inputBuffer.rewind()
+        this.lastFrameBitmap = frameBitmap
         return inputBuffer
     }
 
-    private fun postprocessOutput(outputBuffer: FloatBuffer, originalBitmap: Bitmap): String {
+    private fun saveBitmapForDebug(bitmap: Bitmap, suffix: String) {
+        try {
+            // Define o diretório público de Imagens
+            val storageDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES)
+
+            // Cria um subdiretório para o seu app, se não existir
+            val appDir = File(storageDir, "PlateRecognizerDebug")
+            if (!appDir.exists()) {
+                appDir.mkdirs()
+            }
+
+            // Cria um nome de arquivo único com data e hora
+            val timeStamp = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date())
+            val imageFile = File(appDir, "DEBUG_${timeStamp}_$suffix.jpg")
+
+            // Salva o bitmap como um arquivo JPG
+            val fos = FileOutputStream(imageFile)
+            bitmap.compress(Bitmap.CompressFormat.JPEG, 100, fos)
+            fos.flush()
+            fos.close()
+            Log.d("PlateRecognitionDebug", "Imagem de debug salva em: ${imageFile.absolutePath}")
+        } catch (e: Exception) {
+            Log.e("PlateRecognitionDebug", "Erro ao salvar imagem de debug: ${e.message}", e)
+        }
+    }
+
+
+    private fun postprocessOutput(outputBuffer: FloatBuffer, correctedBitmap: Bitmap): String {
+        // 1. Definimos um resultado padrão.
+        // Ele será alterado se encontrarmos uma placa.
+        var resultString = "Nenhuma placa detectada."
+
         outputBuffer.rewind()
         val rawOutput = Array(outputNumFeaturesPerBox) { FloatArray(outputNumBoxes) }
         for (featureIdx in 0 until outputNumFeaturesPerBox) {
@@ -202,7 +245,7 @@ class MainActivity: FlutterActivity() {
         }
 
         val detections = mutableListOf<Detection>()
-        val confidenceThreshold = 0.25f
+        val confidenceThreshold = 0.6f // Mantendo o limiar mais alto
         for (boxIdx in 0 until outputNumBoxes) {
             val confidence = rawOutput[4][boxIdx]
             if (confidence > confidenceThreshold) {
@@ -217,80 +260,118 @@ class MainActivity: FlutterActivity() {
 
         val iouThreshold = 0.45f
         val finalDetections = applyNms(detections.sortedByDescending { it.confidence }, iouThreshold)
-
         Log.d("PlateRecognition", "Numero de detecoes apos NMS: ${finalDetections.size}")
 
-        if (finalDetections.isNotEmpty()) {
-            val bestDetection = finalDetections.first()
-            val plateBox = convertYoloToPixelCoords(bestDetection, originalBitmap)
+        val filteredByAspectRatio = finalDetections.filter {
+            val aspectRatio = it.width / it.height
+            aspectRatio > 1.5f
+        }
+        Log.d("PlateRecognition", "Numero de detecoes filtradas por aspect ratio: ${filteredByAspectRatio.size}")
+
+        // 2. Se encontrarmos um candidato válido após todos os filtros, entramos neste bloco.
+        if (filteredByAspectRatio.isNotEmpty()) {
+            val bestDetection = filteredByAspectRatio.first()
             Log.d("PlateRecognition", "Placa final detectada com confianca ${bestDetection.confidence}")
 
+            if (lastFrameBitmap != null) {
+                // Coordenadas da caixa na imagem 640x640
+                val boxOnYoloInput = RectF(
+                    (bestDetection.xCenter - bestDetection.width / 2) * modelInputWidth,
+                    (bestDetection.yCenter - bestDetection.height / 2) * modelInputHeight,
+                    (bestDetection.xCenter + bestDetection.width / 2) * modelInputWidth,
+                    (bestDetection.yCenter + bestDetection.height / 2) * modelInputHeight
+                )
+                val yoloViewBitmap = drawRectOnBitmap(lastFrameBitmap!!, boxOnYoloInput, android.graphics.Color.RED)
+                saveBitmapForDebug(yoloViewBitmap, "00_YoloInput_With_Box.jpg")
+            }
+
+            val plateBox = convertYoloToPixelCoords(bestDetection, correctedBitmap)
+
+            val cropAreaOnOriginal = RectF(plateBox.x1, plateBox.y1, plateBox.x2, plateBox.y2)
+            val originalViewBitmap = drawRectOnBitmap(correctedBitmap, cropAreaOnOriginal, android.graphics.Color.GREEN)
+            saveBitmapForDebug(originalViewBitmap, "01_Original_With_CropArea.jpg")
+
             try {
-                // --- LÓGICA DE REFINAMENTO DO RECORTE ---
                 val boxWidth = plateBox.x2 - plateBox.x1
                 val boxHeight = plateBox.y2 - plateBox.y1
-
-                // Define um padding (gordura) para remover as bordas. 10% (0.10f) é um bom começo.
                 val horizontalPadding = boxWidth * 0.10f
                 val verticalPadding = boxHeight * 0.10f
-
-                // Calcula as novas coordenadas, "encolhendo" a caixa
                 val refinedX1 = plateBox.x1 + horizontalPadding
                 val refinedY1 = plateBox.y1 + verticalPadding
                 val refinedX2 = plateBox.x2 - horizontalPadding
                 val refinedY2 = plateBox.y2 - verticalPadding
 
-                // Garante que as coordenadas ainda são válidas
-                val x = refinedX1.toInt().coerceIn(0, originalBitmap.width)
-                val y = refinedY1.toInt().coerceIn(0, originalBitmap.height)
-                val width = (refinedX2 - refinedX1).toInt().coerceAtMost(originalBitmap.width - x).coerceAtLeast(0)
-                val height = (refinedY2 - refinedY1).toInt().coerceAtMost(originalBitmap.height - y).coerceAtLeast(0)
-                // --- FIM DA LÓGICA DE REFINAMENTO ---
+                val x = refinedX1.toInt().coerceIn(0, correctedBitmap.width)
+                val y = refinedY1.toInt().coerceIn(0, correctedBitmap.height)
+                val width = (refinedX2 - refinedX1).toInt().coerceAtMost(correctedBitmap.width - x).coerceAtLeast(0)
+                val height = (refinedY2 - refinedY1).toInt().coerceAtMost(correctedBitmap.height - y).coerceAtLeast(0)
 
-                // Verifique se o bitmap recortado tem um tamanho mínimo para o ML Kit
                 if (width >= 32 && height >= 32) {
-                    val croppedBitmap = Bitmap.createBitmap(originalBitmap, x, y, width, height)
+                    val croppedBitmap = Bitmap.createBitmap(correctedBitmap, x, y, width, height)
+                    saveBitmapForDebug(croppedBitmap, "01_cropped.jpg")
 
-                    // **PRÓXIMO PASSO:** Vamos pré-processar este bitmap antes de enviar ao OCR
                     val ocrReadyBitmap = preprocessBitmapForOcr(croppedBitmap)
-                    val recognizedText = recognizeTextFromBitmap(ocrReadyBitmap) // Usar o bitmap processado
+                    saveBitmapForDebug(ocrReadyBitmap, "02_ocr_readyGray.jpg")
 
+                    val recognizedText = recognizeTextFromBitmap(ocrReadyBitmap)
                     val finalPlate = filterAndFormatPlateText(recognizedText)
 
                     Log.d("PlateRecognition", "Texto cru do OCR: $recognizedText")
                     Log.d("PlateRecognition", "Placa final formatada: $finalPlate")
-                    return "Placa detectada: $finalPlate"
+
+                    // 3. Em vez de retornar, nós atualizamos nossa variável de resultado.
+                    resultString = "Placa detectada: $finalPlate"
                 } else {
-                    // Se a imagem recortada for muito pequena, retorne um erro específico.
                     Log.e("PlateRecognition", "Erro de OCR: Imagem recortada muito pequena (w=$width, h=$height).")
-                    return "Erro de OCR: Imagem recortada muito pequena."
+                    resultString = "Erro de OCR: Imagem recortada muito pequena."
                 }
             } catch (e: Exception) {
                 Log.e("PlateRecognition", "Erro ao recortar imagem ou no OCR: ${e.message}", e)
-                return "Erro ao fazer OCR: ${e.message}"
+                resultString = "Erro ao fazer OCR: ${e.message}"
             }
         }
-        return "Nenhuma placa detectada."
+        // Se a lista (filteredByAspectRatio) estiver vazia, o código simplesmente pula este bloco 'if'
+        // e a 'resultString' mantém seu valor padrão "Nenhuma placa detectada."
+
+        // 4. No final da função, temos um único ponto de saída que retorna o resultado.
+        return resultString
     }
 
-    private fun preprocessBitmapForOcr(bitmap: Bitmap): Bitmap{
+    private fun preprocessBitmapForOcr(bitmap: Bitmap): Bitmap {
+        // 1. Converte para escala de cinza
         val grayBitmap = Bitmap.createBitmap(bitmap.width, bitmap.height, Bitmap.Config.ARGB_8888)
         val canvas = android.graphics.Canvas(grayBitmap)
         val paint = Paint()
-
-        // Configura a matriz de cores para converter para escala de cinza
         val colorMatrix = ColorMatrix()
         colorMatrix.setSaturation(0f)
         paint.colorFilter = ColorMatrixColorFilter(colorMatrix)
-
-        // Desenha o bitmap original no canvas com o filtro de escala de cinza
         canvas.drawBitmap(bitmap, 0f, 0f, paint)
 
-        return grayBitmap
+        // 2. Aplica a Binarização (Thresholding) para criar uma imagem preto e branco
+        val binaryBitmap = Bitmap.createBitmap(grayBitmap.width, grayBitmap.height, Bitmap.Config.ARGB_8888)
+        val pixels = IntArray(grayBitmap.width * grayBitmap.height)
+        grayBitmap.getPixels(pixels, 0, grayBitmap.width, 0, 0, grayBitmap.width, grayBitmap.height)
+
+        val threshold = 128 // Ponto de corte: pixels mais escuros viram preto, mais claros viram branco.
+        for (i in pixels.indices) {
+            val pixel = pixels[i]
+            val red = (pixel shr 16) and 0xFF // Em escala de cinza, R=G=B
+            if (red < threshold) {
+                pixels[i] = android.graphics.Color.BLACK
+            } else {
+                pixels[i] = android.graphics.Color.WHITE
+            }
+        }
+        binaryBitmap.setPixels(pixels, 0, binaryBitmap.width, 0, 0, binaryBitmap.width, binaryBitmap.height)
+
+        // Salve a imagem binarizada para ver o resultado no debug
+        saveBitmapForDebug(binaryBitmap, "03_OcrInput_Binary.jpg")
+
+        return binaryBitmap
     }
     
 
-    private fun convertYoloToPixelCoords(detection: Detection, originalBitmap: Bitmap): BoundingBox {
+    private fun convertYoloToPixelCoords(detection: Detection, correctedBitmap: Bitmap): BoundingBox {
         // Coordenadas na imagem de entrada do modelo (640x640)
         val boxX = detection.xCenter
         val boxY = detection.yCenter
@@ -374,33 +455,68 @@ class MainActivity: FlutterActivity() {
     }
 
     private fun filterAndFormatPlateText(rawText: String): String {
-        // 1. Remover caracteres ambíguos e espaços, mantendo apenas letras e números.
-        // Convertendo para maiúsculas para padronização.
-        val cleanText = rawText.uppercase().replace("[^A-Z0-9]".toRegex(), "")
+        // 1. Divide o texto cru em linhas e converte para maiúsculas.
+        val lines = rawText.uppercase().lines()
 
-        if (cleanText.length < 7) {
-            return "Texto muito curto: '$cleanText'"
+        // 2. Limpa cada linha de caracteres não alfanuméricos
+        //    e encontra a linha mais longa. Esta será nosso melhor candidato a placa.
+        val longestLine = lines
+            .map { it.replace("[^A-Z0-9]".toRegex(), "") }
+            .maxByOrNull { it.length } ?: ""
+
+        // Se não houver uma linha válida, retorne um erro.
+        if (longestLine.length < 7) {
+            return "Padrão não reconhecido: '$longestLine'"
         }
 
-        // 2. Tenta encontrar o padrão Mercosul (3 letras, 1 número, 1 letra, 2 números)
+        // 3. AGORA, aplicamos a lógica de regex apenas na linha mais promissora.
+        val cleanText = longestLine
+
+        // Tenta encontrar o padrão Mercosul (3 letras, 1 número, 1 letra, 2 números)
         val mercosulRegex = "([A-Z]{3})([0-9])([A-Z])([0-9]{2})".toRegex()
         var match = mercosulRegex.find(cleanText)
         if (match != null) {
-            // Encontrou um padrão Mercosul completo
             return match.value
         }
 
-        // 3. Tenta encontrar o padrão antigo (3 letras, 4 números)
+        // Tenta encontrar o padrão antigo (3 letras, 4 números)
         val antigoRegex = "([A-Z]{3})([0-9]{4})".toRegex()
         match = antigoRegex.find(cleanText)
         if (match != null) {
-            // Encontrou um padrão antigo completo
             return match.value
         }
 
-        // 4. Se nenhum padrão foi encontrado, retorna o texto limpo com um aviso.
-        // Pode ser útil para depuração ver o que o OCR retornou.
+        // Se nenhum padrão foi encontrado, retorna o texto limpo com um aviso.
         return "Padrão não reconhecido: '$cleanText'"
+    }
+
+    private fun drawRectOnBitmap(bitmap: Bitmap, rect: RectF, color: Int): Bitmap {
+        val mutableBitmap = bitmap.copy(Bitmap.Config.ARGB_8888, true)
+        val canvas = android.graphics.Canvas(mutableBitmap)
+        val paint = Paint()
+        paint.color = color
+        paint.style = Paint.Style.STROKE
+        paint.strokeWidth = 4.0f
+        canvas.drawRect(rect, paint)
+        return mutableBitmap
+    }
+
+    private fun fixOrientation(bitmap: Bitmap, imagePath: String): Bitmap {
+        val ei = ExifInterface(imagePath)
+        val orientation = ei.getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_UNDEFINED)
+
+        // Com base na orientação dos metadados, criamos uma matriz de transformação
+        val matrix = Matrix()
+        when (orientation) {
+            ExifInterface.ORIENTATION_ROTATE_90 -> matrix.postRotate(90f)
+            ExifInterface.ORIENTATION_ROTATE_180 -> matrix.postRotate(180f)
+            ExifInterface.ORIENTATION_ROTATE_270 -> matrix.postRotate(270f)
+            // Adicione outros casos se necessário, mas estes são os principais
+            else -> return bitmap // Nenhuma rotação necessária, retorna o bitmap original
+        }
+
+        // Cria e retorna um novo bitmap rotacionado
+        return Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
     }
     override fun onDestroy() {
         super.onDestroy()

@@ -4,13 +4,13 @@ import 'package:path_provider/path_provider.dart'; // Para diretório temporári
 import 'package:path/path.dart' show join; // Para juntar caminhos
 import 'dart:io'; // Para operações de arquivo
 import 'package:flutter/services.dart'; // Adicionado: Import necessário para MethodChannel
+import 'package:permission_handler/permission_handler.dart'; // Para solicitar permissões
 
 // Esta lista será preenchida com as câmeras disponíveis no dispositivo
 List<CameraDescription> cameras = [];
 
 // ====================================================================
-// Adicionado: Definição do MethodChannel e função para chamar o nativo
-// O nome do canal DEVE ser EXATAMENTE o mesmo que você usará no Kotlin!
+
 const platform = MethodChannel('com.example.ocr_recog/plate_recognition');
 
 Future<String> recognizePlate(String imagePath) async {
@@ -74,6 +74,7 @@ class _PlateRecognitionScreenState extends State<PlateRecognitionScreen> {
   @override
   void initState() {
     super.initState();
+    _requestPermission();
     // Inicializa a câmera
     if (cameras.isNotEmpty) {
       _controller = CameraController(
@@ -97,6 +98,10 @@ class _PlateRecognitionScreenState extends State<PlateRecognitionScreen> {
     // Descarte o controlador quando o widget for removido da árvore
     _controller?.dispose();
     super.dispose();
+  }
+
+  Future<void> _requestPermission() async {
+    await Permission.storage.request();
   }
 
   // Função para tirar foto (e agora chamará o reconhecimento)
