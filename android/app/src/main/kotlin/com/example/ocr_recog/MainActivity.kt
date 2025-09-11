@@ -39,6 +39,11 @@ import java.util.Locale
 import android.graphics.Matrix
 import androidx.exifinterface.media.ExifInterface
 
+import android.graphics.ImageFormat
+import android.graphics.Rect
+import android.graphics.YuvImage
+import java.io.ByteArrayOutputStream
+
 
 data class Detection(
     val xCenter: Float,
@@ -84,57 +89,106 @@ class MainActivity: FlutterActivity() {
     override fun configureFlutterEngine(@NonNull flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL).setMethodCallHandler { call, result ->
-            if (call.method == "recognizePlate") {
-                val imagePath = call.argument<String>("imagePath")
+            when (call.method) {
+                // Método para o processamento em tempo real (stream)
+                "recognizePlateFromStream" -> {
+                    val bytes = call.argument<ByteArray>("bytes")
+                    val height = call.argument<Int>("height")
+                    val width = call.argument<Int>("width")
 
-                if (imagePath != null) {
-                    // --- ENVOLVE O CÓDIGO COM UMA COROUTINE ---
-                    CoroutineScope(Dispatchers.IO).launch {
-                        try {
-                            if (tfliteInterpreter == null) {
-                                loadModelInterpreter()
-                            }
-
-                            val originalBitmap = BitmapFactory.decodeFile(imagePath)
-                            if (originalBitmap == null) {
-                                withContext(Dispatchers.Main) {
-                                    result.error("IMAGE_LOAD_FAILED", "Não foi possível carregar a imagem.", null)
+                    if (bytes != null && height != null && width != null) {
+                        CoroutineScope(Dispatchers.Default).launch {
+                            try {
+                                val bitmap = yuv420toBitmap(bytes, width, height)
+                                if (bitmap != null) {
+                                    // AQUI ESTÁ A MUDANÇA: chamamos a função centralizada
+                                    val plateText = processImage(bitmap)
+                                    withContext(Dispatchers.Main) {
+                                        result.success(plateText)
+                                    }
+                                } else {
+                                    withContext(Dispatchers.Main) { result.success(null) }
                                 }
-                                return@launch
-                            }
-
-                            val correctedBitmap = fixOrientation(originalBitmap, imagePath)
-
-                            val inputBuffer = preprocessBitmap(correctedBitmap)
-                            val outputBuffer = ByteBuffer.allocateDirect(modelOutputBufferLength).order(ByteOrder.nativeOrder())
-                            val outputMap = mutableMapOf<Int, Any>()
-                            outputMap[0] = outputBuffer // 2. Passe o ByteBuffer para o mapa.
-
-                            tfliteInterpreter?.runForMultipleInputsOutputs(arrayOf(inputBuffer), outputMap)
-
-                            outputBuffer.rewind()
-                            val outputFloatBuffer = outputBuffer.asFloatBuffer()
-
-                            val plateText = postprocessOutput(outputFloatBuffer, correctedBitmap)
-
-                            withContext(Dispatchers.Main) {
-                                result.success(plateText)
-                            }
-                        } catch (e: Exception) {
-                            Log.e("PlateRecognition", "Erro durante o reconhecimento da placa: ${e.message}", e)
-                            withContext(Dispatchers.Main) {
-                                result.error("RECOGNITION_ERROR", "Erro no processamento da placa: ${e.message}", e.toString())
+                            } catch (e: Exception) {
+                                Log.e("RealtimeError", e.message, e)
+                                withContext(Dispatchers.Main) { result.success(null) }
                             }
                         }
+                    } else {
+                        result.error("INVALID_ARGUMENTS", "Argumentos do stream inválidos.", null)
                     }
-                    // ------------------------------------------
-                } else {
-                    result.error("INVALID_PATH", "Caminho da imagem não fornecido.", null)
                 }
-            } else {
-                result.notImplemented()
+
+                // Método antigo para captura de foto única
+                "recognizePlate" -> {
+                    val imagePath = call.argument<String>("imagePath")
+                    if (imagePath != null) {
+                        CoroutineScope(Dispatchers.IO).launch {
+                            try {
+                                val originalBitmap = BitmapFactory.decodeFile(imagePath)
+                                if (originalBitmap != null) {
+                                    val correctedBitmap = fixOrientation(originalBitmap, imagePath)
+                                    // AQUI TAMBÉM: chamamos a MESMA função centralizada
+                                    val plateText = processImage(correctedBitmap)
+                                    withContext(Dispatchers.Main) {
+                                        result.success(plateText)
+                                    }
+                                } else {
+                                    withContext(Dispatchers.Main) {
+                                        result.error("IMAGE_LOAD_FAILED", "Não foi possível carregar a imagem.", null)
+                                    }
+                                }
+                            } catch (e: Exception) {
+                                Log.e("PlateRecognition", "Erro durante o reconhecimento da placa: ${e.message}", e)
+                                withContext(Dispatchers.Main) {
+                                    result.error("RECOGNITION_ERROR", "Erro no processamento da placa: ${e.message}", e.toString())
+                                }
+                            }
+                        }
+                    } else {
+                        result.error("INVALID_PATH", "Caminho da imagem não fornecido.", null)
+                    }
+                }
+                else -> result.notImplemented()
             }
         }
+    }
+
+    private fun processImage(image: Bitmap): String {
+        // Garante que o interpretador TFLite está carregado
+        if (tfliteInterpreter == null) {
+            loadModelInterpreter()
+        }
+
+        // O pipeline que já conhecemos:
+        // 1. Pré-processa a imagem para o formato que o YOLO espera
+        val inputBuffer = preprocessBitmap(image)
+
+        // 2. Prepara o buffer de saída
+        val outputBuffer = ByteBuffer.allocateDirect(modelOutputBufferLength).order(ByteOrder.nativeOrder())
+        val outputMap = mutableMapOf<Int, Any>()
+        outputMap[0] = outputBuffer
+
+        // 3. Executa a inferência do modelo
+        tfliteInterpreter?.runForMultipleInputsOutputs(arrayOf(inputBuffer), outputMap)
+
+        // 4. Prepara o buffer de saída para leitura
+        outputBuffer.rewind()
+        val outputFloatBuffer = outputBuffer.asFloatBuffer()
+
+        // 5. Executa o pós-processamento para extrair e formatar a placa
+        return postprocessOutput(outputFloatBuffer, image)
+    }
+
+    private fun yuv420toBitmap(bytes: ByteArray, width: Int, height: Int): Bitmap? {
+        if (bytes.isEmpty()) return null
+        val out = ByteArrayOutputStream()
+        // O formato da câmera do Flutter YUV_420_888 é compatível com o NV21 do Android
+        val yuvImage = YuvImage(bytes, ImageFormat.NV21, width, height, null)
+        // Comprimimos para JPEG em memória e depois decodificamos para Bitmap
+        yuvImage.compressToJpeg(Rect(0, 0, width, height), 100, out)
+        val imageBytes = out.toByteArray()
+        return BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
     }
 
     private fun loadModelInterpreter() {
@@ -347,6 +401,9 @@ class MainActivity: FlutterActivity() {
         paint.colorFilter = ColorMatrixColorFilter(colorMatrix)
         canvas.drawBitmap(bitmap, 0f, 0f, paint)
 
+        // Salva a imagem em escala de cinza para comparação no debug
+        saveBitmapForDebug(grayBitmap, "02_ocr_readyGray.jpg")
+
         // 2. Aplica a Binarização (Thresholding) para criar uma imagem preto e branco
         val binaryBitmap = Bitmap.createBitmap(grayBitmap.width, grayBitmap.height, Bitmap.Config.ARGB_8888)
         val pixels = IntArray(grayBitmap.width * grayBitmap.height)
@@ -364,7 +421,7 @@ class MainActivity: FlutterActivity() {
         }
         binaryBitmap.setPixels(pixels, 0, binaryBitmap.width, 0, 0, binaryBitmap.width, binaryBitmap.height)
 
-        // Salve a imagem binarizada para ver o resultado no debug
+        // Salva a imagem binarizada para você ver o resultado incrível no debug
         saveBitmapForDebug(binaryBitmap, "03_OcrInput_Binary.jpg")
 
         return binaryBitmap
@@ -455,38 +512,45 @@ class MainActivity: FlutterActivity() {
     }
 
     private fun filterAndFormatPlateText(rawText: String): String {
-        // 1. Divide o texto cru em linhas e converte para maiúsculas.
         val lines = rawText.uppercase().lines()
-
-        // 2. Limpa cada linha de caracteres não alfanuméricos
-        //    e encontra a linha mais longa. Esta será nosso melhor candidato a placa.
         val longestLine = lines
             .map { it.replace("[^A-Z0-9]".toRegex(), "") }
             .maxByOrNull { it.length } ?: ""
 
-        // Se não houver uma linha válida, retorne um erro.
-        if (longestLine.length < 7) {
+        // Mantemos a checagem de 7 caracteres
+        if (longestLine.length != 7) {
             return "Padrão não reconhecido: '$longestLine'"
         }
 
-        // 3. AGORA, aplicamos a lógica de regex apenas na linha mais promissora.
-        val cleanText = longestLine
+        // --- NOVA LÓGICA DE CORREÇÃO INTELIGENTE ---
+        var chars = longestLine.toCharArray()
+        // As 3 primeiras posições DEVEM ser letras. Corrigimos erros comuns de OCR.
+        for (i in 0..2) {
+            if (chars[i] == '0') chars[i] = 'O'
+            if (chars[i] == '1') chars[i] = 'I'
+            if (chars[i] == '5') chars[i] = 'S'
+            // Adicione outras correções aqui se notar mais erros comuns no futuro
+        }
+        // Opcional: O 4º e 6º, 7º caracteres devem ser números
+        val correctedText = String(chars)
+        // --- FIM DA NOVA LÓGICA ---
 
-        // Tenta encontrar o padrão Mercosul (3 letras, 1 número, 1 letra, 2 números)
+        val cleanText = correctedText
+
+        // Tenta encontrar o padrão Mercosul (LLLNLNN)
         val mercosulRegex = "([A-Z]{3})([0-9])([A-Z])([0-9]{2})".toRegex()
         var match = mercosulRegex.find(cleanText)
         if (match != null) {
             return match.value
         }
 
-        // Tenta encontrar o padrão antigo (3 letras, 4 números)
+        // Tenta encontrar o padrão antigo (LLLNNNN)
         val antigoRegex = "([A-Z]{3})([0-9]{4})".toRegex()
         match = antigoRegex.find(cleanText)
         if (match != null) {
             return match.value
         }
 
-        // Se nenhum padrão foi encontrado, retorna o texto limpo com um aviso.
         return "Padrão não reconhecido: '$cleanText'"
     }
 
