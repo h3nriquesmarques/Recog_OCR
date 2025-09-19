@@ -59,31 +59,6 @@ class MyApp extends StatelessWidget {
   }
 }
 
-Future<String?> recognizePlateFromStream(CameraImage image) async {
-  try {
-    // O formato YUV420 tem 3 "planos" de bytes. Vamos juntá-los.
-    final WriteBuffer allBytes = WriteBuffer();
-    for (final Plane plane in image.planes) {
-      allBytes.putUint8List(plane.bytes);
-    }
-    final bytes = allBytes.done().buffer.asUint8List();
-
-    // Enviamos os bytes e as dimensões da imagem para o Kotlin
-    final Map<String, dynamic> arguments = {
-      'bytes': bytes,
-      'height': image.height,
-      'width': image.width,
-    };
-    
-    // Usamos um novo nome de método para o stream
-    final String? result = await platform.invokeMethod('recognizePlateFromStream', arguments);
-    return result;
-  } catch (e) {
-    print("Erro no stream: $e");
-    return null;
-  }
-}
-
 class PlateRecognitionScreen extends StatefulWidget {
   const PlateRecognitionScreen({super.key});
 
@@ -151,6 +126,34 @@ class _PlateRecognitionScreenState extends State<PlateRecognitionScreen> {
       });
     });
   }
+
+  Future<String?> recognizePlateFromStream(CameraImage image) async {
+  try {
+    // O formato YUV420 tem 3 "planos" de bytes. Vamos juntá-los.
+    final WriteBuffer allBytes = WriteBuffer();
+    for (final Plane plane in image.planes) {
+      allBytes.putUint8List(plane.bytes);
+    }
+    final bytes = allBytes.done().buffer.asUint8List();
+
+    final int rotation = _controller!.value.deviceOrientation.index;
+
+    // Enviamos os bytes e as dimensões da imagem para o Kotlin
+    final Map<String, dynamic> arguments = {
+      'bytes': bytes,
+      'height': image.height,
+      'width': image.width,
+      'rotation': rotation,
+    };
+    
+    // Usamos um novo nome de método para o stream
+    final String? result = await platform.invokeMethod('recognizePlateFromStream', arguments);
+    return result;
+  } catch (e) {
+    print("Erro no stream: $e");
+    return null;
+  }
+}
 
   @override
   void dispose() {

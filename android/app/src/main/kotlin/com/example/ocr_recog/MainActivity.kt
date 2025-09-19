@@ -82,7 +82,6 @@ class MainActivity: FlutterActivity() {
     private val outputNumFeaturesPerBox: Int = 5
     private val outputNumBoxes: Int = 8400
     private val modelOutputDataType: DataType = DataType.FLOAT32
-
     private val modelOutputBufferLength: Int = outputBatchSize * outputNumFeaturesPerBox * outputNumBoxes * 4
 
     private var lastFrameBitmap: Bitmap? = null
@@ -90,19 +89,28 @@ class MainActivity: FlutterActivity() {
         super.configureFlutterEngine(flutterEngine)
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL).setMethodCallHandler { call, result ->
             when (call.method) {
-                // Método para o processamento em tempo real (stream)
                 "recognizePlateFromStream" -> {
                     val bytes = call.argument<ByteArray>("bytes")
                     val height = call.argument<Int>("height")
                     val width = call.argument<Int>("width")
+                    val rotation = call.argument<Int>("rotation") // Recebendo o índice da rotação
 
-                    if (bytes != null && height != null && width != null) {
+                    if (bytes != null && height != null && width != null && rotation != null) {
                         CoroutineScope(Dispatchers.Default).launch {
                             try {
                                 val bitmap = yuv420toBitmap(bytes, width, height)
                                 if (bitmap != null) {
-                                    // AQUI ESTÁ A MUDANÇA: chamamos a função centralizada
-                                    val plateText = processImage(bitmap)
+                                    // A lógica de rotação baseada na informação do Flutter
+                                    // 0=Retrato(Pé), 1=Paisagem(Esquerda), 2=Retrato(Invertido), 3=Paisagem(Direita)
+                                    // O sensor da câmera é naturalmente "paisagem", então precisamos girar no modo retrato.
+                                    val finalBitmap = when (rotation) {
+                                        0 -> rotateBitmap(bitmap, 90f)
+                                        2 -> rotateBitmap(bitmap, -90f)
+                                        3 -> rotateBitmap(bitmap, 180f)
+                                        else -> bitmap // Rotação 1 (LandscapeLeft) já está correta
+                                    }
+
+                                    val plateText = processImage(finalBitmap)
                                     withContext(Dispatchers.Main) {
                                         result.success(plateText)
                                     }
@@ -118,36 +126,8 @@ class MainActivity: FlutterActivity() {
                         result.error("INVALID_ARGUMENTS", "Argumentos do stream inválidos.", null)
                     }
                 }
-
-                // Método antigo para captura de foto única
                 "recognizePlate" -> {
-                    val imagePath = call.argument<String>("imagePath")
-                    if (imagePath != null) {
-                        CoroutineScope(Dispatchers.IO).launch {
-                            try {
-                                val originalBitmap = BitmapFactory.decodeFile(imagePath)
-                                if (originalBitmap != null) {
-                                    val correctedBitmap = fixOrientation(originalBitmap, imagePath)
-                                    // AQUI TAMBÉM: chamamos a MESMA função centralizada
-                                    val plateText = processImage(correctedBitmap)
-                                    withContext(Dispatchers.Main) {
-                                        result.success(plateText)
-                                    }
-                                } else {
-                                    withContext(Dispatchers.Main) {
-                                        result.error("IMAGE_LOAD_FAILED", "Não foi possível carregar a imagem.", null)
-                                    }
-                                }
-                            } catch (e: Exception) {
-                                Log.e("PlateRecognition", "Erro durante o reconhecimento da placa: ${e.message}", e)
-                                withContext(Dispatchers.Main) {
-                                    result.error("RECOGNITION_ERROR", "Erro no processamento da placa: ${e.message}", e.toString())
-                                }
-                            }
-                        }
-                    } else {
-                        result.error("INVALID_PATH", "Caminho da imagem não fornecido.", null)
-                    }
+                    // ... seu código de captura única ...
                 }
                 else -> result.notImplemented()
             }
@@ -517,40 +497,42 @@ class MainActivity: FlutterActivity() {
             .map { it.replace("[^A-Z0-9]".toRegex(), "") }
             .maxByOrNull { it.length } ?: ""
 
-        // Mantemos a checagem de 7 caracteres
+        // A validação de 7 caracteres é um excelente primeiro filtro.
         if (longestLine.length != 7) {
             return "Padrão não reconhecido: '$longestLine'"
         }
 
-        // --- NOVA LÓGICA DE CORREÇÃO INTELIGENTE ---
+        // --- LÓGICA DE PRÉ-CORREÇÃO (mantida para robustez) ---
         var chars = longestLine.toCharArray()
-        // As 3 primeiras posições DEVEM ser letras. Corrigimos erros comuns de OCR.
+        // As 3 primeiras posições DEVEM ser letras.
         for (i in 0..2) {
             if (chars[i] == '0') chars[i] = 'O'
             if (chars[i] == '1') chars[i] = 'I'
             if (chars[i] == '5') chars[i] = 'S'
-            // Adicione outras correções aqui se notar mais erros comuns no futuro
         }
-        // Opcional: O 4º e 6º, 7º caracteres devem ser números
-        val correctedText = String(chars)
-        // --- FIM DA NOVA LÓGICA ---
+        val cleanText = String(chars)
+        // --- FIM DA PRÉ-CORREÇÃO ---
 
-        val cleanText = correctedText
+        // Definimos as Regex para os dois padrões brasileiros
+        val mercosulRegex = "[A-Z]{3}[0-9][A-Z][0-9]{2}".toRegex()
+        val antigoRegex = "[A-Z]{3}[0-9]{4}".toRegex()
 
-        // Tenta encontrar o padrão Mercosul (LLLNLNN)
-        val mercosulRegex = "([A-Z]{3})([0-9])([A-Z])([0-9]{2})".toRegex()
-        var match = mercosulRegex.find(cleanText)
-        if (match != null) {
-            return match.value
-        }
+        // --- NOVA LÓGICA DE VALIDAÇÃO ---
+        // Verificamos se o texto limpo CORRESPONDE INTEIRAMENTE a um dos padrões.
 
-        // Tenta encontrar o padrão antigo (LLLNNNN)
-        val antigoRegex = "([A-Z]{3})([0-9]{4})".toRegex()
-        match = antigoRegex.find(cleanText)
-        if (match != null) {
-            return match.value
+        // 1. Testa o Padrão Mercosul
+        if (cleanText.matches(mercosulRegex)) {
+            Log.d("PlateFormatter", "Padrão Mercosul detectado: $cleanText")
+            return cleanText
         }
 
+        // 2. Se não for Mercosul, testa o Padrão Antigo
+        if (cleanText.matches(antigoRegex)) {
+            Log.d("PlateFormatter", "Padrão Antigo detectado: $cleanText")
+            return cleanText
+        }
+
+        // Se não corresponder a nenhum dos dois, o padrão é inválido.
         return "Padrão não reconhecido: '$cleanText'"
     }
 
@@ -582,6 +564,16 @@ class MainActivity: FlutterActivity() {
         // Cria e retorna um novo bitmap rotacionado
         return Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
     }
+
+    private fun rotateBitmap(source: Bitmap, angle: Float): Bitmap {
+        val matrix = Matrix()
+        // Configura a matriz para aplicar a rotação
+        matrix.postRotate(angle)
+        // Cria e retorna um novo bitmap a partir do original, aplicando a matriz de rotação
+        return Bitmap.createBitmap(source, 0, 0, source.width, source.height, matrix, true)
+    }
+
+
     override fun onDestroy() {
         super.onDestroy()
         tfliteInterpreter?.close()
