@@ -44,6 +44,11 @@ import android.graphics.Rect
 import android.graphics.YuvImage
 import java.io.ByteArrayOutputStream
 
+import org.opencv.android.Utils
+import org.opencv.core.Mat
+import org.opencv.core.MatOfDouble
+import org.opencv.imgproc.Imgproc
+
 
 data class Detection(
     val xCenter: Float,
@@ -67,6 +72,11 @@ private var padX: Float = 0.0f
 private var padY: Float = 0.0f
 
 class MainActivity: FlutterActivity() {
+    companion object {
+        init {
+            System.loadLibrary("opencv_java4")
+        }
+    }
     private val CHANNEL = "com.example.ocr_recog/plate_recognition"
     private var tfliteInterpreter: Interpreter? = null
     private val MODEL_PATH = "best_float32.tflite"
@@ -108,6 +118,12 @@ class MainActivity: FlutterActivity() {
                                         2 -> rotateBitmap(bitmap, -90f)
                                         3 -> rotateBitmap(bitmap, 180f)
                                         else -> bitmap // Rotação 1 (LandscapeLeft) já está correta
+                                    }
+
+                                    if (isBlurry(finalBitmap)) {
+                                        Log.d("PlateRecognition", "Frame descartado por borrão (blur).")
+                                        withContext(Dispatchers.Main) { result.success(null) } // Retorna nulo e espera o próximo frame
+                                        return@launch // Para a execução deste frame
                                     }
 
                                     val plateText = processImage(finalBitmap)
@@ -354,7 +370,7 @@ class MainActivity: FlutterActivity() {
                     Log.d("PlateRecognition", "Placa final formatada: $finalPlate")
 
                     // 3. Em vez de retornar, nós atualizamos nossa variável de resultado.
-                    resultString = "Placa detectada: $finalPlate"
+                    resultString = "$finalPlate"
                 } else {
                     Log.e("PlateRecognition", "Erro de OCR: Imagem recortada muito pequena (w=$width, h=$height).")
                     resultString = "Erro de OCR: Imagem recortada muito pequena."
@@ -577,5 +593,24 @@ class MainActivity: FlutterActivity() {
     override fun onDestroy() {
         super.onDestroy()
         tfliteInterpreter?.close()
+    }
+
+    private fun isBlurry(bitmap: Bitmap, threshold: Double = 100.0): Boolean{
+        val mat = Mat()
+        Utils.bitmapToMat(bitmap, mat) // Converte Bitmap para o formato do OpenCV
+
+        val grayMat = Mat()
+        Imgproc.cvtColor(mat, grayMat, Imgproc.COLOR_BGR2GRAY) // Converte para escala de cinza
+
+        val laplacianMat = Mat()
+        Imgproc.Laplacian(grayMat, laplacianMat, org.opencv.core.CvType.CV_64F) // Aplica o filtro Laplaciano
+
+        val meanStdDev = MatOfDouble()
+        org.opencv.core.Core.meanStdDev(laplacianMat, MatOfDouble(), meanStdDev) // Calcula a variância (desvio padrão ao quadrado)
+
+        val variance = Math.pow(meanStdDev.get(0, 0)[0], 2.0)
+        Log.d("BlurDetection", "Variância da imagem: $variance")
+
+        return variance < threshold // Se a variância for menor que o limiar, a imagem está borrada
     }
 }

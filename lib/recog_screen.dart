@@ -1,46 +1,22 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
-import 'package:camera/camera.dart'; // Import para a câmera
-import 'package:path_provider/path_provider.dart'; // Para diretório temporário
-import 'package:path/path.dart' show join; // Para juntar caminhos
-import 'dart:io'; // Para operações de arquivo
-import 'package:flutter/services.dart'; // Adicionado: Import necessário para MethodChannel
-import 'package:permission_handler/permission_handler.dart'; // Para solicitar permissões
+import 'package:camera/camera.dart';
+import 'package:flutter/services.dart';
 
-// Esta lista será preenchida com as câmeras disponíveis no dispositivo
-List<CameraDescription> cameras = [];
+// A lista de câmeras é a única variável que precisa ser global,
+// pois é inicializada no main() antes do app rodar.
+late List<CameraDescription> cameras;
 
-// ====================================================================
-
+// O canal de comunicação também pode ficar aqui.
 const platform = MethodChannel('com.example.ocr_recog/plate_recognition');
 
-Future<String> recognizePlate(String imagePath) async {
-  try {
-    // Chama o método 'recognizePlate' no lado nativo, passando o caminho da imagem como argumento.
-    final String result = await platform.invokeMethod('recognizePlate', {'imagePath': imagePath});
-    return result;
-  } on PlatformException catch (e) {
-    // Captura erros que podem vir do lado nativo
-    print("Erro nativo ao reconhecer placa: '${e.code}': '${e.message}'.");
-    return "Erro: ${e.message}"; // Retorna uma mensagem de erro para ser exibida na UI
-  } catch (e) {
-    // Captura outros erros inesperados
-    print("Erro inesperado ao chamar reconhecimento nativo: $e");
-    return "Erro inesperado: $e";
-  }
-}
-// ====================================================================
-
 Future<void> main() async {
-  // Garante que os widgets do Flutter estejam inicializados
   WidgetsFlutterBinding.ensureInitialized();
-
-  // Obtém a lista de câmeras disponíveis no dispositivo
   try {
     cameras = await availableCameras();
   } on CameraException catch (e) {
     print('Erro ao obter câmeras: ${e.code}, ${e.description}');
   }
-
   runApp(const MyApp());
 }
 
@@ -66,105 +42,144 @@ class PlateRecognitionScreen extends StatefulWidget {
   State<PlateRecognitionScreen> createState() => _PlateRecognitionScreenState();
 }
 
+// ====================================================================
+// TODA A LÓGICA AGORA ESTÁ DENTRO DESTA CLASSE, CORRIGIDA
+// ====================================================================
+
 class _PlateRecognitionScreenState extends State<PlateRecognitionScreen> {
+  // --- VARIÁVEIS DE ESTADO ---
+  // Todas as variáveis que controlam a UI e a lógica ficam aqui dentro.
   CameraController? _controller;
   Future<void>? _initializeControllerFuture;
-  String _recognizedPlate = "Aponte para uma placa..."; // Texto inicial mais apropriado
-  bool _isProcessing = false; // Flag para controlar o processamento do stream
+  bool _isProcessing = false;
+  Timer? _validationTimer;
+
+  String _lastRecognizedPlate = "";
+  bool _isSearching = true;
+  final List<String> _savedPlates = [];
+  // --------------------------------------------------------------------
 
   @override
   void initState() {
     super.initState();
-    // Garante que temos câmeras disponíveis
     if (cameras.isNotEmpty) {
       _controller = CameraController(
-        cameras[0], // Usa a primeira câmera (geralmente a traseira)
-        ResolutionPreset.medium, // 'medium' é ideal para performance de stream
+        cameras[0],
+        ResolutionPreset.high,
         enableAudio: false,
-        imageFormatGroup: ImageFormatGroup.yuv420, // Formato essencial para o stream
+        imageFormatGroup: ImageFormatGroup.yuv420,
       );
 
       _initializeControllerFuture = _controller!.initialize().then((_) {
-        // Este 'if' é uma boa prática para evitar erros se o usuário sair
-        // da tela antes da câmera inicializar.
-        if (!mounted) {
-          return;
-        }
-        // Assim que a câmera estiver pronta, iniciamos o fluxo de imagens.
+        if (!mounted) return;
         _startImageStream();
-        setState(() {}); // Para reconstruir a UI com o preview da câmera
+        setState(() {});
       });
-    } else {
-      // Lida com o caso de não haver câmeras
-      _recognizedPlate = "Nenhuma câmera disponível.";
-      _initializeControllerFuture = Future.value();
     }
   }
-
-  // A nova função que gerencia o fluxo de imagens da câmera
-  void _startImageStream() {
-    _controller!.startImageStream((CameraImage image) {
-      // Se um frame já está sendo processado pelo lado nativo, pulamos este.
-      // Isso evita sobrecarregar o processador.
-      if (_isProcessing) return;
-
-      // Seta a flag para 'true' para bloquear os próximos frames.
-      _isProcessing = true;
-
-      // Chama a função de comunicação nativa para processar o frame
-      recognizePlateFromStream(image).then((result) {
-        // Antes de atualizar a UI, garante que o widget ainda está "vivo"
-        if (mounted && result != null && result.isNotEmpty) {
-          setState(() {
-            _recognizedPlate = result;
-          });
-        }
-      }).whenComplete(() {
-        // IMPORTANTE: Sempre seta a flag de volta para 'false' ao final,
-        // independentemente se houve sucesso ou falha.
-        _isProcessing = false;
-      });
-    });
-  }
-
-  Future<String?> recognizePlateFromStream(CameraImage image) async {
-  try {
-    // O formato YUV420 tem 3 "planos" de bytes. Vamos juntá-los.
-    final WriteBuffer allBytes = WriteBuffer();
-    for (final Plane plane in image.planes) {
-      allBytes.putUint8List(plane.bytes);
-    }
-    final bytes = allBytes.done().buffer.asUint8List();
-
-    final int rotation = _controller!.value.deviceOrientation.index;
-
-    // Enviamos os bytes e as dimensões da imagem para o Kotlin
-    final Map<String, dynamic> arguments = {
-      'bytes': bytes,
-      'height': image.height,
-      'width': image.width,
-      'rotation': rotation,
-    };
-    
-    // Usamos um novo nome de método para o stream
-    final String? result = await platform.invokeMethod('recognizePlateFromStream', arguments);
-    return result;
-  } catch (e) {
-    print("Erro no stream: $e");
-    return null;
-  }
-}
 
   @override
   void dispose() {
-    // É CRUCIAL parar o stream de imagens antes de descartar o controlador
-    // para liberar recursos e economizar bateria.
-    _controller?.stopImageStream();
+    _validationTimer?.cancel();
+    if (_controller != null && _controller!.value.isStreamingImages) {
+      _controller?.stopImageStream();
+    }
     _controller?.dispose();
     super.dispose();
   }
 
-  // A função _takePicture() foi removida pois não é mais necessária.
+  // --- FUNÇÕES DE LÓGICA E CONTROLE (COM A CORREÇÃO PRINCIPAL) ---
+
+  void _startImageStream() {
+    if (_controller != null && !_controller!.value.isStreamingImages) {
+      _controller!.startImageStream((CameraImage image) {
+        if (_isProcessing || !_isSearching) return;
+        _isProcessing = true;
+
+        _recognizePlateFromStream(image).then((result) {
+          if (!mounted || result == null || result.isEmpty || !_isSearching) return;
+
+          // --- ESTA É A CORREÇÃO PRINCIPAL ---
+          // Verificamos se o resultado é um sucesso ANTES de parar o stream.
+          final bool isSuccess = !result.contains('Erro') && !result.contains('Padrão') && !result.contains('Nenhuma placa detectada');
+
+          if (isSuccess) {
+            // SUCESSO: Paramos o stream e iniciamos a validação de 10s.
+            _controller?.stopImageStream();
+            setState(() {
+              _isSearching = false;
+              _lastRecognizedPlate = result;
+            });
+
+            _validationTimer = Timer(const Duration(seconds: 10), () {
+              print("Tempo de validação esgotado! Retomando a busca...");
+              _retrySearch();
+            });
+          }
+          // Se 'isSuccess' for falso (um erro de reconhecimento), nada acontece aqui.
+          // O stream NÃO é parado e a busca continua no próximo frame,
+          // exatamente como você pediu.
+          // ------------------------------------
+
+        }).whenComplete(() {
+          _isProcessing = false;
+        });
+      });
+    }
+  }
+
+  void _confirmPlate() {
+    _validationTimer?.cancel();
+    setState(() {
+      final bool isSuccess = !_lastRecognizedPlate.contains('Erro') && !_lastRecognizedPlate.contains('Padrão');
+      if (isSuccess && _lastRecognizedPlate.isNotEmpty && !_savedPlates.contains(_lastRecognizedPlate)) {
+        _savedPlates.add(_lastRecognizedPlate);
+      }
+      _isSearching = true;
+      _lastRecognizedPlate = "";
+    });
+    _startImageStream();
+  }
+
+  void _retrySearch() {
+    _validationTimer?.cancel();
+    if (mounted) {
+      setState(() {
+        _isSearching = true;
+        _lastRecognizedPlate = "";
+      });
+    }
+    _startImageStream();
+  }
+
+  // --- FUNÇÃO DE COMUNICAÇÃO NATIVA ---
+
+  Future<String?> _recognizePlateFromStream(CameraImage image) async {
+    try {
+      final WriteBuffer allBytes = WriteBuffer();
+      for (final Plane plane in image.planes) {
+        allBytes.putUint8List(plane.bytes);
+      }
+      final bytes = allBytes.done().buffer.asUint8List();
+      
+      final int rotation = _controller!.value.deviceOrientation.index;
+
+      final Map<String, dynamic> arguments = {
+        'bytes': bytes,
+        'height': image.height,
+        'width': image.width,
+        'rotation': rotation,
+      };
+
+      final String? result = await platform.invokeMethod('recognizePlateFromStream', arguments);
+      return result;
+    } catch (e) {
+      print("Erro no stream: $e");
+      return null;
+    }
+  }
+
+  // --- WIDGETS DA UI ---
 
   @override
   Widget build(BuildContext context) {
@@ -174,58 +189,162 @@ class _PlateRecognitionScreenState extends State<PlateRecognitionScreen> {
       ),
       body: Column(
         children: [
-          // --- Área da Câmera (70% da tela) ---
           Expanded(
             flex: 7,
             child: FutureBuilder<void>(
               future: _initializeControllerFuture,
               builder: (context, snapshot) {
                 if (snapshot.connectionState == ConnectionState.done) {
-                  // Garante que o controlador não é nulo e está inicializado
                   if (_controller != null && _controller!.value.isInitialized) {
-                    return CameraPreview(_controller!);
+                    return Stack(
+                      alignment: Alignment.bottomCenter,
+                      children: [
+                        CameraPreview(_controller!),
+                        _buildResultsOverlay(),
+                      ],
+                    );
                   } else {
-                    return const Center(child: Text("Não foi possível iniciar a câmera."));
+                    return const Center(child: Text("Câmera indisponível."));
                   }
                 } else {
-                  // Mostra um indicador de carregamento enquanto a câmera inicializa
                   return const Center(child: CircularProgressIndicator());
                 }
               },
             ),
           ),
-          // --- Área de Texto (30% da tela) ---
           Expanded(
             flex: 3,
-            child: Padding(
-              padding: const EdgeInsets.all(16.0),
-              child: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  TextField(
-                    // Usamos um TextEditingController para que o texto seja atualizado
-                    // eficientemente pela chamada do setState.
-                    controller: TextEditingController(text: _recognizedPlate),
-                    decoration: const InputDecoration(
-                      labelText: 'Placa Reconhecida',
-                      border: OutlineInputBorder(),
+            child: Container(
+              color: Colors.grey[200],
+              child: ListView.builder(
+                itemCount: _savedPlates.length,
+                itemBuilder: (context, index) {
+                  final plate = _savedPlates[index];
+                  return ListTile(
+                    leading: const Icon(Icons.directions_car),
+                    title: Text(plate, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                    trailing: IconButton(
+                      icon: const Icon(Icons.copy),
+                      onPressed: () {
+                        Clipboard.setData(ClipboardData(text: plate));
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          const SnackBar(content: Text('Placa copiada!')),
+                        );
+                      },
                     ),
-                    readOnly: true,
-                    textAlign: TextAlign.center,
-                    style: const TextStyle(fontSize: 22, fontWeight: FontWeight.bold, letterSpacing: 2),
-                  ),
-                  const SizedBox(height: 16),
-                  // O botão foi removido e substituído por uma instrução.
-                  const Text(
-                    "O reconhecimento é automático.",
-                    style: TextStyle(color: Colors.grey),
-                  ),
-                ],
+                  );
+                },
               ),
             ),
           ),
         ],
       ),
     );
+  }
+
+  Widget _buildResultsOverlay() {
+    if (_isSearching) {
+      return Positioned(
+        bottom: 0,
+        left: 0,
+        right: 0,
+        child: Container(
+          padding: const EdgeInsets.all(12.0),
+          decoration: BoxDecoration(
+            color: Colors.black.withOpacity(0.5),
+            borderRadius: const BorderRadius.only(
+              topLeft: Radius.circular(16),
+              topRight: Radius.circular(16),
+            ),
+          ),
+          child: const Text(
+            'Buscando placa...',
+            textAlign: TextAlign.center,
+            style: TextStyle(color: Colors.white, fontSize: 18),
+          ),
+        ),
+      );
+    }
+
+    final bool isSuccess = !_lastRecognizedPlate.contains('Erro') && !_lastRecognizedPlate.contains('Padrão');
+
+    if (isSuccess) {
+      return Positioned(
+        bottom: 0,
+        left: 0,
+        right: 0,
+        child: Container(
+          padding: const EdgeInsets.symmetric(vertical: 8.0, horizontal: 16.0),
+          decoration: BoxDecoration(
+            color: Colors.white,
+            borderRadius: const BorderRadius.only(
+              topLeft: Radius.circular(16),
+              topRight: Radius.circular(16),
+            ),
+            boxShadow: [
+              BoxShadow(color: Colors.black.withOpacity(0.2), spreadRadius: 2, blurRadius: 5),
+            ],
+          ),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              IconButton(
+                icon: const Icon(Icons.close, color: Colors.red, size: 30),
+                onPressed: _retrySearch,
+                tooltip: 'Tentar Novamente',
+              ),
+              Expanded(
+                child: Text(
+                  _lastRecognizedPlate,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold, letterSpacing: 2),
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+              IconButton(
+                icon: const Icon(Icons.check, color: Colors.green, size: 30),
+                onPressed: _confirmPlate,
+                tooltip: 'Confirmar',
+              ),
+            ],
+          ),
+        ),
+      );
+    } else {
+      return Positioned(
+        bottom: 0,
+        left: 0,
+        right: 0,
+        child: Container(
+          padding: const EdgeInsets.symmetric(vertical: 8.0, horizontal: 16.0),
+          decoration: BoxDecoration(
+            color: Colors.red[700],
+            borderRadius: const BorderRadius.only(
+              topLeft: Radius.circular(16),
+              topRight: Radius.circular(16),
+            ),
+          ),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              IconButton(
+                icon: const Icon(Icons.refresh, color: Colors.white, size: 30),
+                onPressed: _retrySearch,
+                tooltip: 'Tentar Novamente',
+              ),
+              Expanded(
+                child: Text(
+                  _lastRecognizedPlate,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(color: Colors.white, fontSize: 16),
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+              const SizedBox(width: 48),
+            ],
+          ),
+        ),
+      );
+    }
   }
 }

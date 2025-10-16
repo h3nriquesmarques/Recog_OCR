@@ -53,6 +53,7 @@ dependencies {
     implementation("com.google.android.gms:play-services-mlkit-text-recognition:19.0.1")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
     implementation("androidx.exifinterface:exifinterface:1.4.1")
+    implementation("org.opencv:opencv:4.9.0")
 }
 
 // --- BLOCO DE RESOLUÇÃO DE DEPENDÊNCIAS (Para o erro de classes duplicadas) ---
